@@ -5,10 +5,14 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_s3 as s3,
     aws_ecs as ecs,
+    aws_elasticloadbalancingv2 as elbv2,
     aws_rds as rds,
     aws_iam as iam,
     aws_secretsmanager as sm,
     aws_ecs_patterns as ecs_patterns,
+    aws_route53 as route53,
+    aws_route53_targets as targets,
+    aws_certificatemanager as acm,
     core
 )
 
@@ -27,6 +31,11 @@ class DeploymentStack(core.Stack):
         container_repo_name = 'mlflow-containers'
         cluster_name = 'mlflow'
         service_name = 'mlflow'
+        hosted_zone_id = 'Z1234ABCD5EFGH'
+        hosted_zone_name = 'example.com'
+        client_id = 'a1b2c3d4e5f6g7h8i9j0k'
+        client_secret = core.SecretValue.secrets_manager('okta_client_secret')
+        authorization_server = 'https://dev-12345678.okta.com'
 
         # ==================================================
         # ================= IAM ROLE =======================
@@ -79,7 +88,7 @@ class DeploymentStack(core.Stack):
         # Creates a security group for AWS RDS
         sg_rds = ec2.SecurityGroup(scope=self, id='SGRDS', vpc=vpc, security_group_name='sg_rds')
         # Adds an ingress rule which allows resources in the VPC's CIDR to access the database.
-        sg_rds.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(port))
+        #sg_rds.add_ingress_rule(peer=ec2.Peer.ipv4('10.0.0.0/24'), connection=ec2.Port.tcp(port))
 
         database = rds.DatabaseInstance(
             scope=self,
@@ -128,33 +137,92 @@ class DeploymentStack(core.Stack):
         port_mapping = ecs.PortMapping(container_port=5000, host_port=5000, protocol=ecs.Protocol.TCP)
         container.add_port_mappings(port_mapping)
 
-        fargate_service = ecs_patterns.NetworkLoadBalancedFargateService(
-            scope=self,
-            id='MLFLOW',
-            service_name=service_name,
-            cluster=cluster,
-            task_definition=task_definition
+        # ==================================================
+        # ================ CERTIFICATE =====================
+        # ==================================================
+        zone = route53.HostedZone.from_hosted_zone_attributes(self, "HostedZone",
+            hosted_zone_id = hosted_zone_id,
+            zone_name = hosted_zone_name
+        )
+        
+        certificate = acm.Certificate(self, "Certificate",
+            domain_name="mlflow." + hosted_zone_name,
+            validation=acm.CertificateValidation.from_dns(zone)
         )
 
-        # Setup security group
-        fargate_service.service.connections.security_groups[0].add_ingress_rule(
-            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            connection=ec2.Port.tcp(5000),
-            description='Allow inbound from VPC for mlflow'
+        # ==================================================
+        # =============== LOAD BALANCER ====================
+        # ==================================================
+        lb = elbv2.ApplicationLoadBalancer(scope=self, id="LB",
+            vpc=vpc,
+            internet_facing=True
         )
+        # redirect HTTP requests to HTTPS
+        lb.add_redirect()
+        # allow Load Balancer to verify OIDC tokens with IDP
+        lb.connections.allow_to_any_ipv4(ec2.Port.tcp(443),"allow ALB to verify token")
+
+        listener = lb.add_listener("Listener",
+            port=443,
+            certificates=[certificate],
+            ssl_policy=elbv2.SslPolicy.TLS12 # May want to confirm your SSL Policy preference https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html#describe-ssl-policies
+        )
+
+        target_group = elbv2.ApplicationTargetGroup(
+            scope=self,
+            id="TG",
+            vpc=vpc,
+            port=80,
+            target_type=elbv2.TargetType.IP
+        )
+
+        target_group.configure_health_check(
+            healthy_threshold_count=5
+        )
+
+        listener.add_action("DefaultAction",
+            action=elbv2.ListenerAction.authenticate_oidc(
+                authorization_endpoint=authorization_server + "/oauth2/default/v1/authorize",
+                client_id=client_id,
+                client_secret=client_secret,
+                issuer=authorization_server + "/oauth2/default",
+                token_endpoint=authorization_server + "/oauth2/default/v1/token",
+                user_info_endpoint=authorization_server + "/oauth2/default/v1/userinfo",
+                scope="openid profile",
+                session_timeout=core.Duration.seconds(300),
+                next=elbv2.ListenerAction.forward([target_group])
+            )
+        )
+        
+        route53.ARecord(
+            scope=self,
+            id="AliasRecord",
+            zone=zone,
+            record_name="mlflow",
+            target=route53.RecordTarget.from_alias(targets.LoadBalancerTarget(lb))
+        )
+
+        fargate_service = ecs.FargateService(
+           scope=self,
+           id='MLFLOW',
+           service_name=service_name,
+           cluster=cluster,
+           task_definition=task_definition
+        )
+
+        fargate_service.node.add_dependency(listener)
+        fargate_service.attach_to_application_target_group(target_group)
+        fargate_service.connections.allow_from(lb, ec2.Port.tcp(5000), "allow from LB")
+        database.connections.allow_default_port_from(fargate_service, "allow from MLFlow Container")
 
         # Setup autoscaling policy
-        scaling = fargate_service.service.auto_scale_task_count(max_capacity=2)
+        scaling = fargate_service.auto_scale_task_count(max_capacity=2)
         scaling.scale_on_cpu_utilization(
             id='AUTOSCALING',
             target_utilization_percent=70,
             scale_in_cooldown=core.Duration.seconds(60),
             scale_out_cooldown=core.Duration.seconds(60)
         )
-        # ==================================================
-        # =================== OUTPUTS ======================
-        # ==================================================
-        core.CfnOutput(scope=self, id='LoadBalancerDNS', value=fargate_service.load_balancer.load_balancer_dns_name)
 
 
 app = core.App()
